@@ -2508,9 +2508,8 @@ class TestAnEntryThatBuildsARunnerHandsOverItsPlacement(CustomTestCase):
     def test_every_publisher_that_builds_a_runner_passes_a_bundle(self):
         import ast as _ast
 
-        root = _pathlib.Path(next(iter(_sglang.__path__))).resolve()
         offenders = []
-        for path in root.rglob("*.py"):
+        for path in _sources():
             text = path.read_text(encoding="utf-8-sig")
             if "ModelRunner(" not in text or "publish(" not in text:
                 continue
@@ -2529,7 +2528,7 @@ class TestAnEntryThatBuildsARunnerHandsOverItsPlacement(CustomTestCase):
                     and getattr(node.func, "id", None) == "publish"
                     and not any(kw.arg == "ranks" for kw in node.keywords)
                 ):
-                    offenders.append(f"{path.relative_to(root)}:{node.lineno}")
+                    offenders.append(f"{path}:{node.lineno}")
         self.assertEqual(
             offenders,
             [],
@@ -2970,9 +2969,8 @@ class TestTheParallelPhase(CustomTestCase):
         itself, because the runner no longer does it on the way past."""
         import ast as _ast
 
-        root = _pathlib.Path(next(iter(_sglang.__path__))).resolve()
         offenders = []
-        for path in root.rglob("*.py"):
+        for path in _sources():
             text = path.read_text(encoding="utf-8-sig")
             if "ModelRunner(" not in text or "publish(" not in text:
                 continue
@@ -2986,7 +2984,7 @@ class TestTheParallelPhase(CustomTestCase):
             if not builds:
                 continue
             if "init_parallel_runtime(" not in text:
-                offenders.append(str(path.relative_to(root)))
+                offenders.append(str(path))
         self.assertEqual(
             offenders,
             [],
