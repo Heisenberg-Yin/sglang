@@ -41,7 +41,7 @@ def ranks_per_host() -> int:
         return 1
     try:
         launch_world_size = get_parallel().launch_world_size
-    except AssertionError:
+    except (RuntimeError, ValueError):
         return 1
     if launch_world_size == 1:
         return 1
@@ -78,7 +78,7 @@ def sync_fixed_hicache_size(size: int, host_size: int) -> int:
         from sglang.srt.runtime_context import get_parallel
 
         pp_group = get_parallel().pp_group
-    except AssertionError:
+    except RuntimeError:
         return size
 
     if pp_group.world_size <= 1:
