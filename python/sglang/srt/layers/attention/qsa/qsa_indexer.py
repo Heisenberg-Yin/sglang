@@ -504,6 +504,7 @@ class QSAIndexer(MultiPlatformOp):
                     row_starts[chunk_slice],
                     row_ends[chunk_slice],
                     self.block_topk,
+                    max_row_keys=max_row_keys,
                 )
             elif relative:
                 chunk_starts = row_starts[chunk_slice]

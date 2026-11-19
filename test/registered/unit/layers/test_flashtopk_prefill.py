@@ -46,11 +46,13 @@ class TestFlashTopKPrefill(unittest.TestCase):
         module = "sglang.srt.layers.attention.qsa.qsa_indexer"
         shape = SimpleNamespace(token_topk=2048, compress_ratio=4, block_topk=512)
         q = torch.zeros(2, 4, 128, dtype=torch.bfloat16)
-        keys = torch.zeros(4, 1, 128, dtype=q.dtype)
-        starts = torch.tensor([0, 2], dtype=torch.int32)
+        # Both requests fit the 512-block budget individually. Packed together
+        # they have more than 512 keys, so only max_row_keys certifies this.
+        keys = torch.zeros(1024, 1, 128, dtype=q.dtype)
+        starts = torch.tensor([0, 512], dtype=torch.int32)
         ends = starts + torch.tensor([2, 1], dtype=torch.int32)
         pos = torch.tensor([7, 5], dtype=torch.int32)
-        lengths = torch.tensor([8, 8], dtype=torch.int32)
+        lengths = torch.tensor([2048, 2048], dtype=torch.int32)
         op = Mock(return_value=torch.full((2, 512), -1, dtype=torch.int32))
         with (
             patch(f"{module}.can_use_flashtopk_prefill", return_value=True),
@@ -58,7 +60,7 @@ class TestFlashTopKPrefill(unittest.TestCase):
             patch.dict(sys.modules, {"flashtopk": SimpleNamespace(select=op)}),
         ):
             tokens = QSAIndexer.select_prefill_tokens(
-                shape, q, keys, starts, ends, pos, lengths
+                shape, q, keys, starts, ends, pos, lengths, max_row_keys=512
             )
         dense.assert_not_called()
         op.assert_not_called()

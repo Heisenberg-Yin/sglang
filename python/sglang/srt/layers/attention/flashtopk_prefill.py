@@ -37,6 +37,7 @@ def select_qsa_blocks(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     topk: int,
+    max_row_keys: int | None = None,
 ) -> torch.Tensor:
     """Select request-relative block IDs from packed, full-block windows."""
     starts = row_starts.to(torch.int32).contiguous()
@@ -44,7 +45,9 @@ def select_qsa_blocks(
     lengths = ends - starts
     # The CUDA fast top-k enumerates a short row in block order.
     sequential = _sequential_blocks(lengths, topk)
-    if compressed_keys.shape[0] <= topk:
+    if compressed_keys.shape[0] <= topk or (
+        max_row_keys is not None and max_row_keys <= topk
+    ):
         return sequential
 
     from flashtopk import select
