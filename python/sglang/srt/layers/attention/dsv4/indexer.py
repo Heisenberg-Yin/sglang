@@ -40,6 +40,11 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
     iter_row_chunks,
 )
+from sglang.srt.layers.attention.flashtopk_prefill import (
+    PREFILL_ROWS_PER_CHUNK,
+    can_use_flashtopk_prefill,
+    select_c4_indices,
+)
 from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
@@ -645,8 +650,11 @@ class C4IndexerBackendMixin:
         page_table: torch.Tensor,
         c4_seq_lens: torch.Tensor,
         query_rows: int,
+        use_flashtopk: bool = False,
     ) -> Optional[NonPagedIndexerPlan]:
-        if query_rows < envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS.get():
+        if not use_flashtopk and (
+            query_rows < envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS.get()
+        ):
             return None
         if not self._can_use_nonpaged_indexer(
             c4_indexer=c4_indexer,
@@ -912,6 +920,9 @@ class C4IndexerBackendMixin:
             and not use_aiter_fp4
         ):
             _c4sl = _c4sl.unsqueeze(-1)
+        use_flashtopk = not use_fp4_indexer and can_use_flashtopk_prefill(
+            q_indexer, 64, torch.float8_e4m3fn
+        )
         nonpaged_plan = None
         if not use_aiter_fp4:
             nonpaged_plan = self._get_nonpaged_indexer_plan(
@@ -921,6 +932,7 @@ class C4IndexerBackendMixin:
                 page_table=page_table,
                 c4_seq_lens=c4_seq_lens,
                 query_rows=query_rows,
+                use_flashtopk=use_flashtopk,
             )
         if self.debug_use_external_c4_sparse_indices:
             return
@@ -1009,8 +1021,26 @@ class C4IndexerBackendMixin:
             )
             for rows in iter_row_chunks(
                 num_rows=nonpaged_plan.query_rows,
-                rows_per_chunk=nonpaged_plan.rows_per_chunk,
+                rows_per_chunk=(
+                    PREFILL_ROWS_PER_CHUNK
+                    if use_flashtopk
+                    else nonpaged_plan.rows_per_chunk
+                ),
             ):
+                if use_flashtopk:
+                    select_c4_indices(
+                        q_indexer[rows],
+                        kv[0],
+                        weights[rows],
+                        kv[1],
+                        nonpaged_plan.ks[rows],
+                        c4_seq_lens[rows],
+                        nonpaged_plan.page_table,
+                        indexer_metadata.compressed_page_size,
+                        c4_sparse_page_indices[rows],
+                        raw_indices[rows] if raw_indices is not None else None,
+                    )
+                    continue
                 logits = self._nonpaged_mqa_logits(
                     q_indexer=q_indexer,
                     weights=weights,

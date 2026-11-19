@@ -7,6 +7,11 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.layers.attention.flashtopk_prefill import (
+    PREFILL_ROWS_PER_CHUNK,
+    can_use_flashtopk_prefill,
+    select_qsa_blocks,
+)
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
@@ -467,10 +472,18 @@ class QSAIndexer(MultiPlatformOp):
             and q.is_cuda
             and HAS_TILELANG
         )
-        row_chunk_size = _qsa_prefill_row_chunk_size(
-            rows,
-            max_row_keys if relative else compressed_keys.shape[0],
-            q.shape[1],
+        use_flashtopk = (
+            self.compress_ratio == 4
+            and self.block_topk == 512
+            and compressed_keys.dtype == torch.bfloat16
+            and can_use_flashtopk_prefill(q, 4, torch.bfloat16)
+        )
+        row_chunk_size = (
+            PREFILL_ROWS_PER_CHUNK
+            if use_flashtopk
+            else _qsa_prefill_row_chunk_size(
+                rows, max_row_keys if relative else compressed_keys.shape[0], q.shape[1]
+            )
         )
         for row_start in range(0, rows, row_chunk_size):
             row_end = min(row_start + row_chunk_size, rows)
@@ -483,6 +496,15 @@ class QSAIndexer(MultiPlatformOp):
                     device=q.device,
                 )
                 logits = None
+            elif use_flashtopk:
+                logits = None
+                block_indices = select_qsa_blocks(
+                    q[chunk_slice],
+                    compressed_keys,
+                    row_starts[chunk_slice],
+                    row_ends[chunk_slice],
+                    self.block_topk,
+                )
             elif relative:
                 chunk_starts = row_starts[chunk_slice]
                 chunk_lengths = row_ends[chunk_slice] - chunk_starts

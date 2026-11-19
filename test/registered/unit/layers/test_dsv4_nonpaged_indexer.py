@@ -370,7 +370,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         page_table = torch.tensor([[3, 1]], dtype=torch.int32).repeat(query_rows, 1)
         c4_seq_lens = torch.tensor([62, 63, 64, 65], dtype=torch.int32)
 
-        def build_plan():
+        def build_plan(use_flashtopk=False):
             return C4IndexerBackendMixin._get_nonpaged_indexer_plan(
                 backend,
                 c4_indexer=c4_indexer,
@@ -379,11 +379,15 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
                 page_table=page_table,
                 c4_seq_lens=c4_seq_lens,
                 query_rows=query_rows,
+                use_flashtopk=use_flashtopk,
             )
 
         threshold = envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS
         with threshold.override(threshold.default):
             self.assertIsNone(build_plan())
+            # Fused scoring also supports tails below the dense gather cutoff.
+            self.assertIsNotNone(build_plan(use_flashtopk=True))
+        metadata.nonpaged_plan = None
         with threshold.override(query_rows):
             plan = build_plan()
         self.assertEqual(
