@@ -107,22 +107,24 @@ class TestFlashTopKPrefill(unittest.TestCase):
                 ke=torch.tensor([0, 0, 0, 513]),
                 page_table=table,
                 query_rows=4,
+                rows_per_chunk=4,
             )
         )
         backend._gather_nonpaged_index_k = Mock(return_value=(object(), object()))
         backend._nonpaged_mqa_logits = Mock()
+        inputs = dict(
+            x=torch.empty(4, 1),
+            q_lora=torch.empty(4, 1),
+            c4_indexer=SimpleNamespace(use_fp4_indexer=False, layer_id=0),
+            forward_batch=SimpleNamespace(forward_mode=ForwardMode.EXTEND),
+        )
         with (
             patch(f"{module}.can_use_flashtopk_prefill", return_value=True),
             patch(f"{module}.get_global_indexer_capturer", return_value=None),
             patch(f"{module}.select_c4_indices") as fused,
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
         ):
-            backend.forward_c4_indexer(
-                x=torch.empty(4, 1),
-                q_lora=torch.empty(4, 1),
-                c4_indexer=SimpleNamespace(use_fp4_indexer=False, layer_id=0),
-                forward_batch=SimpleNamespace(forward_mode=ForwardMode.EXTEND),
-            )
+            backend.forward_c4_indexer(**inputs)
         backend._nonpaged_mqa_logits.assert_not_called()
         self.assertTrue(
             backend._get_nonpaged_indexer_plan.call_args.kwargs["use_flashtopk"]
@@ -133,6 +135,26 @@ class TestFlashTopKPrefill(unittest.TestCase):
         self.assertIs(args[6], table)
         self.assertEqual(args[8].data_ptr(), core.c4_sparse_page_indices.data_ptr())
         self.assertEqual(args[9].data_ptr(), core.c4_sparse_raw_indices.data_ptr())
+
+        # A different model-configured block budget retains the native backend.
+        core.c4_sparse_page_indices = torch.empty(4, 2048, dtype=torch.int32)
+        backend._nonpaged_mqa_logits.return_value = torch.zeros(4, 2048)
+        with (
+            patch(f"{module}.can_use_flashtopk_prefill", return_value=True),
+            patch(f"{module}.get_global_indexer_capturer", return_value=None),
+            patch(f"{module}.select_c4_indices") as fused,
+            patch(f"{module}.topk_transform_paged"),
+            patch.object(
+                backend.dsa_topk_backend, "should_use_topk_v2", return_value=False
+            ),
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
+        ):
+            backend.forward_c4_indexer(**inputs)
+        fused.assert_not_called()
+        self.assertFalse(
+            backend._get_nonpaged_indexer_plan.call_args.kwargs["use_flashtopk"]
+        )
+        backend._nonpaged_mqa_logits.assert_called_once()
 
     def test_c4_raw_and_physical_slots_use_true_lengths(self):
         q = torch.zeros(4, 64, 128, dtype=torch.float8_e4m3fn)

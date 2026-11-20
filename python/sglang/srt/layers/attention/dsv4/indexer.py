@@ -920,8 +920,10 @@ class C4IndexerBackendMixin:
             and not use_aiter_fp4
         ):
             _c4sl = _c4sl.unsqueeze(-1)
-        use_flashtopk = not use_fp4_indexer and can_use_flashtopk_prefill(
-            q_indexer, 64, torch.float8_e4m3fn
+        use_flashtopk = (
+            not use_fp4_indexer
+            and c4_sparse_page_indices.shape[1] in (512, 1024)
+            and can_use_flashtopk_prefill(q_indexer, 64, torch.float8_e4m3fn)
         )
         nonpaged_plan = None
         if not use_aiter_fp4:
