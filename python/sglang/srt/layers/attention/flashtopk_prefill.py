@@ -5,6 +5,8 @@ from __future__ import annotations
 import math
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_sm100_supported
@@ -31,6 +33,66 @@ def _sequential_blocks(lengths: torch.Tensor, topk: int) -> torch.Tensor:
     return torch.where(cols < lengths[:, None], cols, -1)
 
 
+@triton.jit
+def _finalize_indices_kernel(
+    OUT,
+    STARTS,
+    LENGTHS,
+    stride_row,
+    topk: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SUBTRACT_STARTS: tl.constexpr,
+):
+    """In-place post-processing per row: fill short rows (length <= topk) sequentially,
+    and optionally convert packed QSA indices to request-relative offsets. Long rows with
+    start == 0 return immediately without touching global memory."""
+    row = tl.program_id(0).to(tl.int64)
+    length = tl.load(LENGTHS + row)
+    if length <= topk:
+        col = tl.arange(0, BLOCK_K)
+        mask = col < topk
+        vals = tl.where(col < length, col, -1).to(tl.int32)
+        tl.store(OUT + row * stride_row + col, vals, mask=mask)
+        return
+    if SUBTRACT_STARTS:
+        start = tl.load(STARTS + row)
+        if start != 0:
+            col = tl.arange(0, BLOCK_K)
+            mask = col < topk
+            ptr = OUT + row * stride_row + col
+            idx = tl.load(ptr, mask=mask, other=-1)
+            tl.store(ptr, tl.where(idx >= 0, idx - start, -1), mask=mask)
+
+
+def _finalize_indices(
+    out: torch.Tensor,
+    starts: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    *,
+    subtract_starts: bool,
+) -> torch.Tensor:
+    if out.numel() == 0:
+        return out
+    if out.is_cuda:
+        _finalize_indices_kernel[(out.shape[0],)](
+            out,
+            starts,
+            lengths,
+            out.stride(0),
+            topk=topk,
+            BLOCK_K=triton.next_power_of_2(topk),
+            SUBTRACT_STARTS=subtract_starts,
+            num_warps=4,
+        )
+        return out
+    short = lengths <= topk
+    sequential = _sequential_blocks(lengths, topk)
+    if subtract_starts:
+        out = torch.where(out >= 0, out - starts[:, None], -1)
+    return torch.where(short[:, None], sequential, out)
+
+
 def select_qsa_blocks(
     q: torch.Tensor,
     compressed_keys: torch.Tensor,
@@ -44,28 +106,30 @@ def select_qsa_blocks(
     ends = row_ends.to(torch.int32).contiguous()
     lengths = ends - starts
     # The CUDA fast top-k enumerates a short row in block order.
-    sequential = _sequential_blocks(lengths, topk)
     if compressed_keys.shape[0] <= topk or (
         max_row_keys is not None and max_row_keys <= topk
     ):
-        return sequential
+        return _sequential_blocks(lengths, topk)
 
     from flashtopk import select
 
     short = lengths <= topk
-    weights = torch.ones(q.shape[:2], dtype=torch.float32, device=q.device)
+    out = torch.empty((q.shape[0], topk), dtype=torch.int32, device=q.device)
     indices = select(
         q.contiguous(),
         compressed_keys.squeeze(1).contiguous(),
-        weights,
+        None,
         starts,
         torch.where(short, starts, ends),
         topk=topk,
         pruning="off",
+        chunk_size=PREFILL_ROWS_PER_CHUNK,
+        out=out,
         score_divisor=math.sqrt(q.shape[-1]),
     )
-    relative = torch.where(indices >= 0, indices - starts[:, None], -1)
-    return torch.where(short[:, None], sequential, relative)
+    if indices is not out:
+        out = indices
+    return _finalize_indices(out, starts, lengths, topk, subtract_starts=True)
 
 
 def select_c4_indices(
@@ -85,10 +149,9 @@ def select_c4_indices(
 
     topk = out_pages.shape[1]
     lengths = lengths.reshape(-1).to(torch.int32).contiguous()
-    # All keys in short rows survive. Preserve the native backend's sequential
-    # order there, including the zero-complete-block case.
-    result = _sequential_blocks(lengths, topk)
-    if keys.shape[0] > topk:
+    if keys.shape[0] <= topk:
+        out_pages.copy_(_sequential_blocks(lengths, topk))
+    else:
         from flashtopk import select
 
         short = lengths <= topk
@@ -100,12 +163,19 @@ def select_c4_indices(
             torch.where(short, starts, lengths),
             kv_scales=key_scales.contiguous(),
             topk=topk,
-            pruning="off",
+            pruning="adaptive",
+            chunk_size=PREFILL_ROWS_PER_CHUNK,
+            out=out_pages,
         )
-        result = torch.where(short[:, None], result, indices)
-    out_pages.copy_(result)
+        if indices is not out_pages:
+            out_pages.copy_(indices)
+        finalized = _finalize_indices(
+            out_pages, starts, lengths, topk, subtract_starts=False
+        )
+        if finalized is not out_pages:
+            out_pages.copy_(finalized)
     if out_raw is not None:
-        out_raw.copy_(result)
+        out_raw.copy_(out_pages)
     # There is one row in the compact page table. The start of every C4 window
     # is zero, so starts is also the row-to-request map.
     topk_page_table_transform_(out_pages, page_table, starts, page_size)

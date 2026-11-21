@@ -32,10 +32,11 @@ class TestFlashTopKPrefill(unittest.TestCase):
         q_arg, keys_arg, weights, ks, ke = op.call_args.args
         self.assertEqual(keys_arg.shape, (15, 128))
         self.assertEqual(q_arg.shape, (4, 4, 128))
-        torch.testing.assert_close(weights, torch.ones(4, 4))
+        self.assertIsNone(weights)
         torch.testing.assert_close(ks, starts)
         self.assertEqual(ke.tolist(), [0, 6, 6, 14])
         self.assertEqual(op.call_args.kwargs["score_divisor"], math.sqrt(128))
+        self.assertEqual(op.call_args.kwargs["chunk_size"], 8192)
         self.assertEqual(
             blocks.tolist(), [[-1, -1, -1], [0, 1, -1], [0, 1, 2], [6, 2, 5]]
         )
